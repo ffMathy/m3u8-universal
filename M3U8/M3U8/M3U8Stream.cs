@@ -1,58 +1,193 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
+using System.Net.Http;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading.Tasks;
+using Windows.Foundation;
+using Windows.Storage.Streams;
 
 namespace M3U8
 {
-    public class M3U8Stream : Stream
+    public class M3U8Stream : IRandomAccessStream
     {
-        public override void Flush()
+        private readonly string _url;
+
+        private readonly Dictionary<string, byte[]> _internalBuffer;
+
+        private bool _stop;
+
+        public M3U8Stream(string url)
         {
-            throw new InvalidOperationException("This stream can't be written to.");
+            _internalBuffer = new Dictionary<string, byte[]>();
+
+            _stop = false;
+            _url = url;
+
+            StartDownloading(url);
         }
 
-        public override int Read(byte[] buffer, int offset, int count)
+        private async void StartDownloading(string url)
         {
-            throw new NotImplementedException();
+            using (var client = new HttpClient())
+            {
+                while (!_stop)
+                {
+                    var data = await client.GetStringAsync(url);
+
+                    var lines = data.Split('\n');
+                    if (lines.Any())
+                    {
+                        const int defaultTargetDuration = 100;
+                        var targetDuration = defaultTargetDuration;
+
+                        var firstLine = lines[0];
+                        if (firstLine != "#EXTM3U")
+                        {
+                            throw new InvalidOperationException(
+                                "The provided URL does not link to a well-formed M3U8 playlist.");
+                        }
+
+                        for (var i = 1; i < lines.Length; i++)
+                        {
+                            var line = lines[i];
+                            if (line.StartsWith("#"))
+                            {
+                                var lineData = line.Substring(1);
+
+                                var split = lineData.Split(':');
+
+                                var name = split[0];
+                                var value = split[1];
+
+                                switch (name)
+                                {
+                                    case "EXT-X-TARGETDURATION":
+                                        if (targetDuration == defaultTargetDuration)
+                                        {
+                                            targetDuration = int.Parse(value);
+                                        }
+                                        break;
+
+                                    //oh, how sweet. a header for us to entirely ignore. we'll always use cache.
+                                    case "EXT-X-ALLOW-CACHE":
+                                        break;
+
+                                    case "EXT-X-VERSION":
+                                        break;
+
+                                    case "EXT-X-MEDIA-SEQUENCE":
+                                        break;
+
+                                    case "EXTINF":
+                                        var nextLine = lines[i + 1];
+                                        if (!_internalBuffer.ContainsKey(nextLine) && !_stop)
+                                        {
+                                            var bytes = await client.GetByteArrayAsync(nextLine);
+                                            _internalBuffer.Add(nextLine, bytes);
+                                        }
+                                        break;
+                                }
+                            }
+                        }
+
+                        //wait for a new part of the stream to appear if we're lucky.
+                        await Task.Delay(targetDuration * 1000 / 2);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException(
+                            "The provided URL does not contain any data.");
+                    }
+                }
+            }
         }
 
-        public override long Seek(long offset, SeekOrigin origin)
+        public void Dispose()
         {
-            throw new NotImplementedException();
+            _stop = true;
         }
 
-        public override void SetLength(long value)
+        public IAsyncOperationWithProgress<IBuffer, uint> ReadAsync(IBuffer buffer, uint count, InputStreamOptions options)
         {
-            throw new InvalidOperationException("This stream can't have its length set because it is based on an infinite-length stream.");
+            return AsyncInfo.Run<IBuffer, uint>((token, progress) =>
+                Task.Run(async delegate()
+                {
+                    var bytesRead = 0u;
+
+                    //keep going until we've read all data.
+                    while (bytesRead < count && !token.IsCancellationRequested)
+                    {
+
+                        var firstKey = string.Empty;
+                        while (string.IsNullOrEmpty(firstKey) && !token.IsCancellationRequested)
+                        {
+                            //while we don't have data in the trunk, wait for it.
+                            firstKey = _internalBuffer.Keys.FirstOrDefault();
+                            await Task.Delay(100, token);
+                        }
+
+                        //did we cancel? exit out.
+                        if (token.IsCancellationRequested)
+                        {
+                            return buffer;
+                        }
+
+                        //copy the data over.
+                        var bufferData = _internalBuffer[firstKey];
+
+                        var amount = Math.Min(bufferData.Length, count - bytesRead);
+                        bufferData.CopyTo(0, buffer, bytesRead, (int)amount);
+
+                        //increment bytes read.
+                        bytesRead += (uint)amount;
+
+                        //report the progress.
+                        progress.Report(bytesRead);
+
+                    }
+
+                    return buffer;
+
+                }, token));
+
         }
 
-        public override void Write(byte[] buffer, int offset, int count)
+        public IAsyncOperationWithProgress<uint, uint> WriteAsync(IBuffer buffer)
         {
-            throw new InvalidOperationException("This stream can't be written to.");
+            throw new InvalidOperationException();
         }
 
-        public override bool CanRead
+        public IAsyncOperation<bool> FlushAsync()
         {
-            get { return true; }
+            throw new InvalidOperationException();
         }
 
-        public override bool CanSeek
+        public IInputStream GetInputStreamAt(ulong position)
         {
-            get { return true; }
+            throw new InvalidOperationException();
         }
 
-        public override bool CanWrite
+        public IOutputStream GetOutputStreamAt(ulong position)
         {
-            get { return false; }
+            throw new InvalidOperationException();
         }
 
-        public override long Length
+        public void Seek(ulong position)
         {
-            get { return long.MaxValue; }
+            Position = position;
         }
 
-        public override long Position { get; set; }
+        public IRandomAccessStream CloneStream()
+        {
+            return new M3U8Stream(_url);
+        }
+
+        public bool CanRead { get; private set; }
+        public bool CanWrite { get; private set; }
+        public ulong Position { get; private set; }
+        public ulong Size { get; set; }
     }
 }
